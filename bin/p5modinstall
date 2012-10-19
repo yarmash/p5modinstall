@@ -1,0 +1,153 @@
+#!/usr/local/bin/bash
+
+if [ $EUID -ne 0 ]; then
+	echo >&2 "This script must be run as root"
+	exit 1
+fi
+
+# Turn on extended globbing
+shopt -s extglob
+
+function usage() {
+	local USAGE="Usage: $0 [-fs] [name]"
+	echo >&2 "$USAGE"
+	exit 1
+}
+
+while getopts "fs" opt; do
+	case $opt in
+		f)
+			# -f option forces re-install of core modules from ports
+			OPT_OVERRIDE_CORE="on"
+			;;
+		s)
+			# -s option forces search in pkg-plist files
+			OPT_SEARCH_PLIST="on"
+			;;
+		\?)
+			usage
+			;;
+	esac
+done
+
+shift $((OPTIND-1))
+
+if [ $# -eq 0 ]; then
+	usage
+fi
+
+# number of spaces after a module name when printing a message
+MARGIN=10
+
+# left-justify a module name within this field when printing a message
+FIELD_LEN=0
+
+for arg in "$@"; do
+	if (( ${#arg}+MARGIN > FIELD_LEN )); then
+		FIELD_LEN=$(( ${#arg}+MARGIN ))
+	fi
+done
+
+# params: 1 - module name, 2 - message
+function print_message() {
+	printf "%-${FIELD_LEN}s%s\n" "$@"
+}
+
+while [ "$#" -gt "0" ]; do
+	name=$1
+	shift
+
+	# Check if module already installed
+
+	# Try a quick pkg_info test first
+	pkg=$(pkg_info -EX "^(bsdpan-${name//::/-}|p5-${name//::/-})-[0-9]+")
+
+	if [ $? -eq 0 ]; then
+		print_message $name "Installed by package $pkg"
+		continue
+	fi
+
+	# Now try perldoc
+	modulepath=$(perldoc -lm $name 2> /dev/null)
+
+	if [ $? -eq 0 ]; then # the module is found
+		# find out which package it belongs to
+		pkg=$(pkg_info -qW "$modulepath" 2> /dev/null)
+
+		if [ $pkg ]; then
+			# If a core module, allow to re-install from ports if the "-f" option is present
+			if [ ${pkg:0:5} = "perl-" ]; then
+				if [ -z "$OPT_OVERRIDE_CORE" ]; then
+					print_message $name "Installed by package $pkg (-f to force)"
+					continue
+				fi
+			else
+				print_message $name "Installed by package $pkg"
+				continue
+			fi
+		fi
+	fi
+
+	# Module is not installed. Look for a port and try to install
+
+	portname=
+
+	# Create a pattern. NOTE: this requires the extglob shell option
+	pattern="/usr/ports/!(distfiles)/p5-${name//::/-}"
+
+	# The array size is always >= 1, unless nullglob is set
+	ports=($pattern)
+
+	# The pattern matched more than one port
+	if [ "${#ports[*]}" -gt 1 ]; then
+		print_message $name "\"$name\" is ambiguous: ${ports[*]#/usr/ports/}"
+		continue
+	fi
+
+	# The pattern matched no ports
+	if [ "$ports" = "$pattern" ]; then
+		# If the "-s" option was specified, search pkg-plist files in the ports tree
+		if [ -n "$OPT_SEARCH_PLIST" ]; then
+
+			# read the INDEX-N file line by line
+			while read i; do
+				if [ ${i:0:3} = "p5-" ]; then
+					# Remove everything but the path
+					i=${i#*|}
+					i=${i%%|*}
+
+					# search the pkg-plist file, if exists
+					if [ -f "$i/pkg-plist" ]; then
+						while read p; do
+							# Look for either .pm or .pod file
+							if [\
+								"$p" = "%%SITE_PERL%%/${name//:://}.pm" -o \
+								"$p" = "%%SITE_PERL%%/%%PERL_ARCH%%/${name//:://}.pm" -o \
+								"$p" = "%%SITE_PERL%%/${name//:://}.pod" -o \
+								"$p" = "%%SITE_PERL%%/%%PERL_ARCH%%/${name//:://}.pod" ]; then
+
+								portname=${i#/usr/ports/*/}
+								break 2
+							fi
+						done < $i/pkg-plist
+					fi
+				fi
+			done < /usr/ports/INDEX-$(uname -r | cut -c 1)
+		fi
+
+		if [ -z $portname ]; then
+			if [ -n "$OPT_SEARCH_PLIST" ]; then
+				print_message $name "No port found"
+				continue
+			else
+				print_message $name "No port found (-s to search pkg-plist files)"
+				continue
+			fi
+		fi
+	else
+		portname=${ports#/usr/ports/*/}
+	fi
+
+	make -C /usr/ports/*/$portname install clean
+done
+
